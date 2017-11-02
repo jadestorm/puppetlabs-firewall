@@ -57,12 +57,17 @@ Puppet::Type.newtype(:firewall) do
   feature :ipsec_policy, "Match IPsec policy"
   feature :ipsec_dir, "Match IPsec policy direction"
   feature :mask, "Ability to match recent rules based on the ipv4 mask"
+  feature :nflog_group, "netlink group to subscribe to for logging"
+  feature :nflog_prefix, ""
+  feature :nflog_range, ""
+  feature :nflog_threshold, ""
   feature :ipset, "Match against specified ipset list"
   feature :clusterip, "Configure a simple cluster of nodes that share a certain IP and MAC address without an explicit load balancer in front of them."
   feature :length, "Match the length of layer-3 payload"
   feature :string_matching, "String matching features"
   feature :queue_num, "Which NFQUEUE to send packets to"
   feature :queue_bypass, "If nothing is listening on queue_num, allow packets to bypass the queue"
+  feature :hashlimit, "Hashlimit features"
 
   # provider specific features
   feature :iptables, "The provider provides iptables features."
@@ -129,8 +134,17 @@ Puppet::Type.newtype(:firewall) do
     EOS
 
     munge do |value|
+      case @resource[:provider]
+      when :iptables
+        protocol = :IPv4
+      when :ip6tables
+        protocol = :IPv6
+      else
+        self.fail("cannot work out protocol family")
+      end
+
       begin
-        @resource.host_to_mask(value)
+        @resource.host_to_mask(value, protocol)
       rescue Exception => e
         self.fail("host_to_ip failed for #{value}, exception #{e}")
       end
@@ -179,8 +193,17 @@ Puppet::Type.newtype(:firewall) do
     EOS
 
     munge do |value|
+      case @resource[:provider]
+      when :iptables
+        protocol = :IPv4
+      when :ip6tables
+        protocol = :IPv6
+      else
+        self.fail("cannot work out protocol family")
+      end
+
       begin
-        @resource.host_to_mask(value)
+        @resource.host_to_mask(value, protocol)
       rescue Exception => e
         self.fail("host_to_ip failed for #{value}, exception #{e}")
       end
@@ -448,6 +471,7 @@ Puppet::Type.newtype(:firewall) do
       * DNAT
       * SNAT
       * LOG
+      * NFLOG
       * MASQUERADE
       * REDIRECT
       * MARK
@@ -618,6 +642,67 @@ Puppet::Type.newtype(:firewall) do
     newvalues(:true, :false)
   end
 
+  newproperty(:nflog_group, :required_features => :nflog_group) do
+    desc <<-EOS
+      Used with the jump target NFLOG.
+      The netlink group (0 - 2^16-1) to which packets are (only applicable
+      for nfnetlink_log). Defaults to 0.
+    EOS
+
+    validate do |value|
+      if value.to_i > (2**16)-1 || value.to_i < 0
+        raise ArgumentError, "nflog_group must be between 0 and 2^16-1"
+      end
+    end
+
+    munge do |value|
+      if value.is_a?(String) and value =~ /^[-0-9]+$/
+        Integer(value)
+      else
+        value
+      end
+    end
+  end
+
+  newproperty(:nflog_prefix, :required_features => :nflog_prefix) do
+    desc <<-EOS
+      Used with the jump target NFLOG.
+      A prefix string to include in the log message, up to 64 characters long,
+      useful for distinguishing messages in the logs.
+    EOS
+
+    validate do |value|
+      if value.length > 64
+        raise ArgumentError, "nflog_prefix must be less than 64 characters."
+      end
+    end
+  end
+
+  newproperty(:nflog_range, :required_features => :nflog_range) do
+    desc <<-EOS
+      Used with the jump target NFLOG.
+      The number of bytes to be copied to userspace (only applicable for nfnetlink_log).
+      nfnetlink_log instances may specify their own range, this option overrides it.
+    EOS
+  end
+
+  newproperty(:nflog_threshold, :required_features => :nflog_threshold) do
+    desc <<-EOS
+      Used with the jump target NFLOG.
+      Number of packets to queue inside the kernel before sending them to userspace
+      (only applicable for nfnetlink_log). Higher values result in less overhead
+      per packet, but increase delay until the packets reach userspace. Defaults to 1.
+    EOS
+
+    munge do |value|
+      if value.is_a?(String) and value =~ /^[-0-9]+$/
+        Integer(value)
+      else
+        value
+      end
+    end
+  end
+
   # ICMP matching property
   newproperty(:icmp, :required_features => :icmp_match) do
     desc <<-EOS
@@ -625,6 +710,8 @@ Puppet::Type.newtype(:firewall) do
 
       A value of "any" is not supported. To achieve this behaviour the
       parameter should simply be omitted or undefined.
+      An array of values is also not supported. To match against multiple ICMP
+      types, please use separate rules for each ICMP type.
     EOS
 
     validate do |value|
@@ -632,6 +719,11 @@ Puppet::Type.newtype(:firewall) do
         raise ArgumentError,
           "Value 'any' is not valid. This behaviour should be achieved " \
           "by omitting or undefining the ICMP parameter."
+      end
+      if value.kind_of?(Array)
+        raise ArgumentError,
+          "Argument must not be an array of values. To match multiple " \
+          "ICMP types, please use separate rules for each ICMP type."
       end
     end
 
@@ -656,6 +748,7 @@ Puppet::Type.newtype(:firewall) do
         self.fail("cannot work out icmp type")
       end
       value
+      
     end
   end
 
@@ -670,9 +763,10 @@ Puppet::Type.newtype(:firewall) do
       * ESTABLISHED
       * NEW
       * RELATED
+      * UNTRACKED
     EOS
 
-    newvalues(:INVALID,:ESTABLISHED,:NEW,:RELATED)
+    newvalues(:INVALID,:ESTABLISHED,:NEW,:RELATED,:UNTRACKED)
 
     # States should always be sorted. This normalizes the resource states to
     # keep it consistent with the sorted result from iptables-save.
@@ -701,9 +795,10 @@ Puppet::Type.newtype(:firewall) do
       * ESTABLISHED
       * NEW
       * RELATED
+      * UNTRACKED
     EOS
 
-    newvalues(:INVALID,:ESTABLISHED,:NEW,:RELATED)
+    newvalues(:INVALID,:ESTABLISHED,:NEW,:RELATED,:UNTRACKED)
 
     # States should always be sorted. This normalizes the resource states to
     # keep it consistent with the sorted result from iptables-save.
@@ -1513,6 +1608,79 @@ Puppet::Type.newtype(:firewall) do
     newvalues(/^[A-Z]{2}(,[A-Z]{2})*$/)
   end
 
+  newproperty(:hashlimit_name) do
+    desc <<-EOS
+      The name for the /proc/net/ipt_hashlimit/foo entry.
+      This parameter is required.
+    EOS
+  end
+
+  newproperty(:hashlimit_upto) do
+    desc <<-EOS
+      Match if the rate is below or equal to amount/quantum. It is specified either as a number, with an optional time quantum suffix (the default is 3/hour), or as amountb/second (number of bytes per second).
+      This parameter or hashlimit_above is required.
+      Allowed forms are '40','40/second','40/minute','40/hour','40/day'.
+    EOS
+  end
+
+  newproperty(:hashlimit_above) do
+    desc <<-EOS
+      Match if the rate is above amount/quantum.
+      This parameter or hashlimit_upto is required.
+      Allowed forms are '40','40/second','40/minute','40/hour','40/day'.
+    EOS
+  end
+
+  newproperty(:hashlimit_burst) do
+    desc <<-EOS
+      Maximum initial number of packets to match: this number gets recharged by one every time the limit specified above is not reached, up to this number; the default is 5. When byte-based rate matching is requested, this option specifies the amount of bytes that can exceed the given rate. This option should be used with caution -- if the entry expires, the burst value is reset too.
+    EOS
+    newvalue(/^\d+$/)
+  end
+
+  newproperty(:hashlimit_mode) do
+    desc <<-EOS
+      A comma-separated list of objects to take into consideration. If no --hashlimit-mode option is given, hashlimit acts like limit, but at the expensive of doing the hash housekeeping.
+      Allowed values are: srcip, srcport, dstip, dstport
+    EOS
+  end
+
+  newproperty(:hashlimit_srcmask) do
+    desc <<-EOS
+      When --hashlimit-mode srcip is used, all source addresses encountered will be grouped according to the given prefix length and the so-created subnet will be subject to hashlimit. prefix must be between (inclusive) 0 and 32. Note that --hashlimit-srcmask 0 is basically doing the same thing as not specifying srcip for --hashlimit-mode, but is technically more expensive.
+    EOS
+  end
+
+  newproperty(:hashlimit_dstmask) do
+    desc <<-EOS
+      Like --hashlimit-srcmask, but for destination addresses.
+    EOS
+  end
+
+  newproperty(:hashlimit_htable_size) do
+    desc <<-EOS
+      The number of buckets of the hash table
+    EOS
+  end
+
+  newproperty(:hashlimit_htable_max) do
+    desc <<-EOS
+      Maximum entries in the hash.
+    EOS
+  end
+
+  newproperty(:hashlimit_htable_expire) do
+    desc <<-EOS
+      After how many milliseconds do hash entries expire.
+    EOS
+  end
+
+  newproperty(:hashlimit_htable_gcinterval) do
+    desc <<-EOS
+      How many milliseconds between garbage collection intervals.
+    EOS
+  end
+
   autorequire(:firewallchain) do
     reqs = []
     protocol = nil
@@ -1718,5 +1886,10 @@ Puppet::Type.newtype(:firewall) do
       end
     end
 
+    if value(:hashlimit_name)
+      unless value(:hashlimit_upto) || value(:hashlimit_above)
+        self.fail "Either hashlimit_upto or hashlimit_above are required"
+      end
+    end
   end
 end
